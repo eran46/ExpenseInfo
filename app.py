@@ -451,34 +451,68 @@ def show_overview(df):
     
     with tab1:
         if not df_expenses.empty:
-            category_totals = df_expenses.groupby('Category')['Cost'].sum().reset_index()
-            category_totals = category_totals.sort_values('Cost', ascending=False)
+            # Month selector
+            col1, col2 = st.columns([1, 3])
             
-            fig_pie = px.pie(
-                category_totals,
-                values='Cost',
-                names='Category',
-                title='Spending by Category',
-                hole=0.4
-            )
-            
-            fig_pie.update_traces(
-                textposition='auto',
-                textinfo='percent+label'
-            )
-            
-            fig_pie.update_layout(
-                showlegend=True,
-                legend=dict(
-                    orientation="v",
-                    yanchor="middle",
-                    y=0.5,
-                    xanchor="left",
-                    x=1.02
+            with col1:
+                # Get available months
+                df_expenses_temp = df_expenses.copy()
+                df_expenses_temp['YearMonth'] = df_expenses_temp['Date'].dt.to_period('M')
+                available_months = sorted(df_expenses_temp['YearMonth'].unique(), reverse=True)
+                
+                # Create options: "All Time" + specific months
+                month_options = ['All Time'] + [str(m) for m in available_months]
+                
+                selected_month = st.selectbox(
+                    "Select Period",
+                    options=month_options,
+                    index=0,
+                    key="category_breakdown_month"
                 )
-            )
             
-            st.plotly_chart(fig_pie, use_container_width=True)
+            # Filter data by selected month
+            if selected_month == 'All Time':
+                filtered_df = df_expenses
+                title = 'Spending by Category (All Time)'
+            else:
+                filtered_df = df_expenses_temp[df_expenses_temp['YearMonth'] == selected_month].copy()
+                title = f'Spending by Category ({selected_month})'
+            
+            if not filtered_df.empty:
+                category_totals = filtered_df.groupby('Category')['Cost'].sum().reset_index()
+                category_totals = category_totals.sort_values('Cost', ascending=False)
+                
+                fig_pie = px.pie(
+                    category_totals,
+                    values='Cost',
+                    names='Category',
+                    title=title,
+                    hole=0.4
+                )
+                
+                fig_pie.update_traces(
+                    textposition='auto',
+                    textinfo='percent+label'
+                )
+                
+                fig_pie.update_layout(
+                    showlegend=True,
+                    legend=dict(
+                        orientation="v",
+                        yanchor="middle",
+                        y=0.5,
+                        xanchor="left",
+                        x=1.02
+                    )
+                )
+                
+                st.plotly_chart(fig_pie, use_container_width=True)
+                
+                # Show total for selected period
+                total = category_totals['Cost'].sum()
+                st.metric(f"Total Spending ({selected_month})", f"₪{total:,.0f}")
+            else:
+                st.info(f"No expense data available for {selected_month}")
         else:
             st.info("No expense data available")
     
