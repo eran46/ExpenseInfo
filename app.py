@@ -1256,10 +1256,10 @@ def show_combined_analytics():
         st.info("No data available in selected groups")
         return
     
-    combined_df = pd.concat(all_data, ignore_index=True)
+    combined_df_original = pd.concat(all_data, ignore_index=True)
     
-    # Exclude Payment/Settlement and reimbursement transactions (same as Overview)
-    combined_df = exclude_payments_and_reimbursements(combined_df)
+    # For plots, exclude Payment/Settlement and reimbursement transactions (same as Overview)
+    combined_df = exclude_payments_and_reimbursements(combined_df_original)
     
     # Get all members across selected groups
     all_members = groups_mgr.get_all_members_across_groups(selected_group_ids)
@@ -1304,16 +1304,16 @@ def show_combined_analytics():
         # Show metrics for all expenses
         col1, col2, col3, col4 = st.columns(4)
         
-        # Calculate Total Spent as sum of member expenses (NO EXCLUSIONS for the metric)
+        # Calculate Total Spent as sum of member expenses from ORIGINAL unfiltered data (matches Overview ₪222k)
         dm = get_data_manager()
-        member_cols = dm.get_member_columns(combined_df_filtered) if not combined_df_filtered.empty else []
+        member_cols = dm.get_member_columns(combined_df_original) if not combined_df_original.empty else []
         
         total_spent = 0.0
         if member_cols:
             for member_col in member_cols:
-                if member_col in combined_df_filtered.columns:
+                if member_col in combined_df_original.columns:
                     # Convert to numeric to avoid string comparison errors
-                    member_values = pd.to_numeric(combined_df_filtered[member_col], errors='coerce').fillna(0)
+                    member_values = pd.to_numeric(combined_df_original[member_col], errors='coerce').fillna(0)
                     total_spent += member_values[member_values > 0].sum()
         
         with col1:
@@ -1338,25 +1338,9 @@ def show_combined_analytics():
         # Spending by group
         st.subheader("💰 Spending by Group")
         
-        # Calculate spending by group as sum of member expenses
-        group_spending_data = []
-        for group_name in combined_df_for_plots['Group'].unique():
-            group_df = combined_df_for_plots[combined_df_for_plots['Group'] == group_name]
-            group_emoji = group_df['GroupEmoji'].iloc[0] if not group_df.empty else ''
-            
-            group_total = 0.0
-            for member_col in member_cols:
-                if member_col in group_df.columns:
-                    member_values = pd.to_numeric(group_df[member_col], errors='coerce').fillna(0)
-                    group_total += member_values[member_values > 0].sum()
-            
-            group_spending_data.append({
-                'Group': group_name,
-                'GroupEmoji': group_emoji,
-                'Total': group_total
-            })
-        
-        group_spending = pd.DataFrame(group_spending_data)
+        # Calculate spending by group using Cost
+        group_spending = combined_df_for_plots.groupby(['Group', 'GroupEmoji'])['Cost'].sum().reset_index()
+        group_spending.columns = ['Group', 'GroupEmoji', 'Total']
         group_spending['Display'] = group_spending['GroupEmoji'] + ' ' + group_spending['Group']
         
         col1, col2 = st.columns(2)
@@ -1382,29 +1366,16 @@ def show_combined_analytics():
         # Category breakdown
         st.subheader("📊 Category Breakdown Across Groups")
         
-        # Calculate category totals as sum of member expenses
-        category_spending_data = []
-        for category in combined_df_for_plots['Category'].unique():
-            cat_df = combined_df_for_plots[combined_df_for_plots['Category'] == category]
-            
-            cat_total = 0.0
-            for member_col in member_cols:
-                if member_col in cat_df.columns:
-                    member_values = pd.to_numeric(cat_df[member_col], errors='coerce').fillna(0)
-                    cat_total += member_values[member_values > 0].sum()
-            
-            category_spending_data.append({
-                'Category': category,
-                'Total': cat_total
-            })
-        
-        category_data = pd.DataFrame(category_spending_data)
+        # Calculate category totals using Cost
+        category_data = combined_df_for_plots.groupby('Category')['Cost'].sum().reset_index()
+        category_data.columns = ['Category', 'Total']
         category_data = category_data.sort_values('Total', ascending=False).head(10)
         
         fig_categories = px.bar(
             category_data,
             x='Category',
             y='Total',
+            color='Category',
             title=f'Top 10 Categories Across All Groups{" - " + selected_month_all if selected_month_all != "All Time" else ""}'
         )
         st.plotly_chart(fig_categories, use_container_width=True)
@@ -1412,25 +1383,12 @@ def show_combined_analytics():
         # Timeline
         st.subheader("📈 Timeline Across Groups")
         
-        # Calculate timeline data as sum of member expenses per month (exclude Payment/reimbursements)
-        combined_df_timeline = exclude_payments_and_reimbursements(combined_df.copy())
+        # Calculate timeline data using Cost (Payment/reimbursements already excluded in combined_df)
+        combined_df_timeline = combined_df.copy()
         combined_df_timeline['YearMonth'] = combined_df_timeline['Date'].dt.to_period('M').astype(str)
         
-        timeline_spending_data = []
-        for (year_month, group), group_df in combined_df_timeline.groupby(['YearMonth', 'Group']):
-            month_total = 0.0
-            for member_col in member_cols:
-                if member_col in group_df.columns:
-                    member_values = pd.to_numeric(group_df[member_col], errors='coerce').fillna(0)
-                    month_total += member_values[member_values > 0].sum()
-            
-            timeline_spending_data.append({
-                'YearMonth': year_month,
-                'Group': group,
-                'Total': month_total
-            })
-        
-        timeline_data = pd.DataFrame(timeline_spending_data)
+        timeline_data = combined_df_timeline.groupby(['YearMonth', 'Group'])['Cost'].sum().reset_index()
+        timeline_data.columns = ['YearMonth', 'Group', 'Total']
         
         fig_timeline = px.line(
             timeline_data,
@@ -1527,16 +1485,15 @@ def show_combined_analytics():
                 if selected_month_member != 'All Time':
                     member_txns_df = member_txns_df[member_txns_df['YearMonth'] == pd.Period(selected_month_member)]
                 
-                # Recalculate category data from filtered transactions
+                # Recalculate category data from filtered transactions using Cost
                 category_data = {}
                 for _, row in member_txns_df.iterrows():
-                    member_share = row.get('member_share', 0)
+                    total_cost = row.get('total_cost', 0)
                     try:
-                        member_share = float(member_share)
-                        if member_share != 0:
+                        total_cost = float(total_cost)
+                        if total_cost > 0:
                             category = row.get('category', 'Uncategorized')
-                            expense = abs(member_share) if member_share > 0 else 0
-                            category_data[category] = category_data.get(category, 0) + expense
+                            category_data[category] = category_data.get(category, 0) + total_cost
                     except (ValueError, TypeError):
                         continue
             else:
@@ -1570,14 +1527,15 @@ def show_combined_analytics():
                 member_txns_df_group['YearMonth'] = member_txns_df_group['date'].dt.to_period('M')
                 member_txns_df_group = member_txns_df_group[member_txns_df_group['YearMonth'] == pd.Period(selected_month_member)]
                 
-                # Recalculate group breakdown from filtered transactions
+                # Recalculate group breakdown from filtered transactions using Cost
                 group_breakdown = {}
                 for _, row in member_txns_df_group.iterrows():
                     group_name = row.get('group_name', 'Unknown')
-                    member_share = row.get('member_share', 0)
+                    total_cost = row.get('total_cost', 0)
                     try:
-                        member_share = float(member_share)
-                        group_breakdown[group_name] = group_breakdown.get(group_name, 0) + abs(member_share)
+                        total_cost = float(total_cost)
+                        if total_cost > 0:
+                            group_breakdown[group_name] = group_breakdown.get(group_name, 0) + total_cost
                     except (ValueError, TypeError):
                         continue
             else:
