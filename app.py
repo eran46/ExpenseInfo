@@ -193,6 +193,34 @@ def exclude_payments_and_reimbursements(df):
     df = exclude_reimbursements(df)
     return df
 
+def calculate_total_spending(df):
+    """
+    Calculate Total Spending as the sum of all member expenses (what they actually paid).
+    This matches the sum of all members' "Total Personal Expense" values.
+    
+    Returns the sum of positive member values (what members actually paid out).
+    """
+    if df.empty:
+        return 0.0
+    
+    # Get member columns
+    dm = get_data_manager()
+    member_cols = dm.get_member_columns(df)
+    
+    if not member_cols:
+        return 0.0
+    
+    # Sum all positive values (what members paid)
+    total = 0.0
+    for member_col in member_cols:
+        if member_col in df.columns:
+            # Sum only positive values (payments made) - convert to numeric first
+            member_values = pd.to_numeric(df[member_col], errors='coerce').fillna(0)
+            positive_values = member_values[member_values > 0].sum()
+            total += positive_values
+    
+    return total
+
 # Income calculation functions
 def normalize_to_monthly(amount, frequency):
     """Convert any frequency to monthly amount"""
@@ -619,22 +647,46 @@ def show_data_management():
 
 def show_overview(df):
     """Show overview page with summary and charts"""
-    # Exclude payments and reimbursements for metrics
+    # Calculate Total Spending as sum of member expenses (NO exclusions - matches Combined Analytics)
+    total_spending = calculate_total_spending(df)
+    
+    # Get expenses dataframe for plots (exclude Payment and reimbursements for display)
     df_expenses = exclude_payments_and_reimbursements(df)
     
-    # Calculate metrics
-    total_spending = df_expenses['Cost'].sum()
+    # Get member columns for calculations
+    dm = get_data_manager()
+    member_cols = dm.get_member_columns(df) if not df.empty else []
     
-    # Historic monthly average
-    df_expenses_copy = df_expenses.copy()
-    df_expenses_copy['YearMonth'] = df_expenses_copy['Date'].dt.to_period('M')
-    monthly_totals = df_expenses_copy.groupby('YearMonth')['Cost'].sum()
-    historic_avg = monthly_totals.mean() if len(monthly_totals) > 0 else 0
+    # Historic monthly average - use member expenses (no exclusions)
+    if not df.empty and member_cols:
+        df_copy = df.copy()
+        df_copy['YearMonth'] = df_copy['Date'].dt.to_period('M')
+        
+        # Calculate monthly totals as sum of member expenses
+        monthly_data = []
+        for year_month, group in df_copy.groupby('YearMonth'):
+            month_total = 0.0
+            for member_col in member_cols:
+                if member_col in group.columns:
+                    member_values = pd.to_numeric(group[member_col], errors='coerce').fillna(0)
+                    month_total += member_values[member_values > 0].sum()
+            monthly_data.append({'YearMonth': year_month, 'Total': month_total})
+        
+        if monthly_data:
+            monthly_df = pd.DataFrame(monthly_data)
+            historic_avg = monthly_df['Total'].mean()
+        else:
+            historic_avg = 0
+    else:
+        historic_avg = 0
     
-    # Current month spending
+    # Current month spending - use Cost from filtered data (matches Trends & History tab)
     current_month = datetime.now().replace(day=1).date()
     current_month_data = df_expenses[df_expenses['Date'].dt.date >= current_month]
-    current_month_spending = current_month_data['Cost'].sum()
+    if not current_month_data.empty:
+        current_month_spending = current_month_data['Cost'].sum()
+    else:
+        current_month_spending = 0
     
     # Get income data
     dm = get_data_manager()
@@ -738,12 +790,14 @@ def show_overview(df):
                 title = f'Spending by Category ({selected_month})'
             
             if not filtered_df.empty:
+                # Calculate category totals using Cost (for plots only)
                 category_totals = filtered_df.groupby('Category')['Cost'].sum().reset_index()
-                category_totals = category_totals.sort_values('Cost', ascending=False)
+                category_totals.columns = ['Category', 'Total']
+                category_totals = category_totals.sort_values('Total', ascending=False)
                 
                 fig_pie = px.pie(
                     category_totals,
-                    values='Cost',
+                    values='Total',
                     names='Category',
                     title=title,
                     hole=0.4
@@ -767,9 +821,10 @@ def show_overview(df):
                 
                 st.plotly_chart(fig_pie, use_container_width=True)
                 
-                # Show total for selected period
-                total = category_totals['Cost'].sum()
-                st.metric(f"Total Spending ({selected_month})", f"₪{total:,.0f}")
+                # Show total for selected period (this is for filtered expenses only)
+                total = category_totals['Total'].sum()
+                st.metric(f"Expenses Shown in Chart ({selected_month})", f"₪{total:,.0f}",
+                         help="This shows expenses excluding Payment category and reimbursements")
             else:
                 st.info(f"No expense data available for {selected_month}")
         else:
@@ -777,6 +832,7 @@ def show_overview(df):
     
     with tab2:
         if not df_expenses.empty:
+            # Calculate monthly spending using Cost (excluding Payment & reimbursements)
             df_timeline = df_expenses.copy()
             df_timeline['YearMonth'] = df_timeline['Date'].dt.to_period('M').astype(str)
             
@@ -1248,12 +1304,24 @@ def show_combined_analytics():
         # Show metrics for all expenses
         col1, col2, col3, col4 = st.columns(4)
         
+        # Calculate Total Spent as sum of member expenses (NO EXCLUSIONS for the metric)
+        dm = get_data_manager()
+        member_cols = dm.get_member_columns(combined_df_filtered) if not combined_df_filtered.empty else []
+        
+        total_spent = 0.0
+        if member_cols:
+            for member_col in member_cols:
+                if member_col in combined_df_filtered.columns:
+                    # Convert to numeric to avoid string comparison errors
+                    member_values = pd.to_numeric(combined_df_filtered[member_col], errors='coerce').fillna(0)
+                    total_spent += member_values[member_values > 0].sum()
+        
         with col1:
             st.metric("Total Groups", len(selected_group_ids))
         with col2:
             st.metric("Total Transactions", len(combined_df_filtered))
         with col3:
-            st.metric("Total Spent", f"₪{combined_df_filtered['Cost'].sum():,.2f}")
+            st.metric("Total Spent", f"₪{total_spent:,.2f}")
         with col4:
             if not combined_df_filtered.empty:
                 date_range_str = f"{combined_df_filtered['Date'].min().date()} to {combined_df_filtered['Date'].max().date()}"
@@ -1264,9 +1332,31 @@ def show_combined_analytics():
         # Visualizations
         st.markdown("---")
         
+        # For plots, exclude Payment and reimbursements
+        combined_df_for_plots = exclude_payments_and_reimbursements(combined_df_filtered)
+        
         # Spending by group
         st.subheader("💰 Spending by Group")
-        group_spending = combined_df_filtered.groupby(['Group', 'GroupEmoji'])['Cost'].sum().reset_index()
+        
+        # Calculate spending by group as sum of member expenses
+        group_spending_data = []
+        for group_name in combined_df_for_plots['Group'].unique():
+            group_df = combined_df_for_plots[combined_df_for_plots['Group'] == group_name]
+            group_emoji = group_df['GroupEmoji'].iloc[0] if not group_df.empty else ''
+            
+            group_total = 0.0
+            for member_col in member_cols:
+                if member_col in group_df.columns:
+                    member_values = pd.to_numeric(group_df[member_col], errors='coerce').fillna(0)
+                    group_total += member_values[member_values > 0].sum()
+            
+            group_spending_data.append({
+                'Group': group_name,
+                'GroupEmoji': group_emoji,
+                'Total': group_total
+            })
+        
+        group_spending = pd.DataFrame(group_spending_data)
         group_spending['Display'] = group_spending['GroupEmoji'] + ' ' + group_spending['Group']
         
         col1, col2 = st.columns(2)
@@ -1274,7 +1364,7 @@ def show_combined_analytics():
         with col1:
             fig_pie = px.pie(
                 group_spending,
-                values='Cost',
+                values='Total',
                 names='Display',
                 title=f'Spending Distribution by Group{" - " + selected_month_all if selected_month_all != "All Time" else ""}'
             )
@@ -1284,7 +1374,7 @@ def show_combined_analytics():
             fig_bar = px.bar(
                 group_spending,
                 x='Display',
-                y='Cost',
+                y='Total',
                 title=f'Total Spending by Group{" - " + selected_month_all if selected_month_all != "All Time" else ""}'
             )
             st.plotly_chart(fig_bar, use_container_width=True)
@@ -1292,26 +1382,60 @@ def show_combined_analytics():
         # Category breakdown
         st.subheader("📊 Category Breakdown Across Groups")
         
-        category_data = combined_df_filtered.groupby('Category')['Cost'].sum().reset_index()
-        category_data = category_data.sort_values('Cost', ascending=False).head(10)
+        # Calculate category totals as sum of member expenses
+        category_spending_data = []
+        for category in combined_df_for_plots['Category'].unique():
+            cat_df = combined_df_for_plots[combined_df_for_plots['Category'] == category]
+            
+            cat_total = 0.0
+            for member_col in member_cols:
+                if member_col in cat_df.columns:
+                    member_values = pd.to_numeric(cat_df[member_col], errors='coerce').fillna(0)
+                    cat_total += member_values[member_values > 0].sum()
+            
+            category_spending_data.append({
+                'Category': category,
+                'Total': cat_total
+            })
+        
+        category_data = pd.DataFrame(category_spending_data)
+        category_data = category_data.sort_values('Total', ascending=False).head(10)
         
         fig_categories = px.bar(
             category_data,
             x='Category',
-            y='Cost',
+            y='Total',
             title=f'Top 10 Categories Across All Groups{" - " + selected_month_all if selected_month_all != "All Time" else ""}'
         )
         st.plotly_chart(fig_categories, use_container_width=True)
         
         # Timeline
         st.subheader("📈 Timeline Across Groups")
-        combined_df['YearMonth'] = combined_df['Date'].dt.to_period('M').astype(str)
-        timeline_data = combined_df.groupby(['YearMonth', 'Group'])['Cost'].sum().reset_index()
+        
+        # Calculate timeline data as sum of member expenses per month (exclude Payment/reimbursements)
+        combined_df_timeline = exclude_payments_and_reimbursements(combined_df.copy())
+        combined_df_timeline['YearMonth'] = combined_df_timeline['Date'].dt.to_period('M').astype(str)
+        
+        timeline_spending_data = []
+        for (year_month, group), group_df in combined_df_timeline.groupby(['YearMonth', 'Group']):
+            month_total = 0.0
+            for member_col in member_cols:
+                if member_col in group_df.columns:
+                    member_values = pd.to_numeric(group_df[member_col], errors='coerce').fillna(0)
+                    month_total += member_values[member_values > 0].sum()
+            
+            timeline_spending_data.append({
+                'YearMonth': year_month,
+                'Group': group,
+                'Total': month_total
+            })
+        
+        timeline_data = pd.DataFrame(timeline_spending_data)
         
         fig_timeline = px.line(
             timeline_data,
             x='YearMonth',
-            y='Cost',
+            y='Total',
             color='Group',
             title='Monthly Spending by Group'
         )
@@ -1669,12 +1793,15 @@ def show_analytics(df):
         df_monthly = df_monthly[df_monthly['Category'] == selected_category_monthly]
     
     df_monthly['YearMonth'] = df_monthly['Date'].dt.to_period('M').astype(str)
+    
+    # Calculate monthly totals using Cost
     monthly_totals = df_monthly.groupby(['YearMonth', 'Category'])['Cost'].sum().reset_index()
+    monthly_totals.columns = ['YearMonth', 'Category', 'Total']
     
     fig_monthly = px.bar(
         monthly_totals,
         x='YearMonth',
-        y='Cost',
+        y='Total',
         color='Category',
         title=f"Monthly Spending - {selected_category_monthly}",
         barmode='stack'
@@ -1696,44 +1823,51 @@ def show_analytics(df):
     
     st.markdown("---")
     
-    # Yearly spending by category
-    st.subheader("Yearly Spending by Category")
-    selected_category_yearly = st.selectbox(
-        "Select Category",
-        options=categories,
-        key="yearly_category"
-    )
+    # Yearly spending by category - Monthly Average Pie Chart
+    st.subheader("Monthly Average Spending by Category")
     
     df_yearly = df_all_expenses.copy()
-    if selected_category_yearly != 'All Categories':
-        df_yearly = df_yearly[df_yearly['Category'] == selected_category_yearly]
+    df_yearly['Year'] = df_yearly['Date'].dt.year
+    df_yearly['YearMonth'] = df_yearly['Date'].dt.to_period('M')
     
-    df_yearly['Year'] = df_yearly['Date'].dt.year.astype(str)
-    yearly_totals = df_yearly.groupby(['Year', 'Category'])['Cost'].sum().reset_index()
+    # Get available years
+    available_years = sorted(df_yearly['Year'].unique(), reverse=True)
     
-    fig_yearly = px.bar(
-        yearly_totals,
-        x='Year',
-        y='Cost',
-        color='Category',
-        title=f"Yearly Spending - {selected_category_yearly}",
-        barmode='stack'
-    )
-    
-    fig_yearly.update_layout(
-        xaxis_title="Year",
-        yaxis_title="Amount (₪)",
-        xaxis_type='category',
-        legend=dict(
-            orientation="v",
-            yanchor="top",
-            y=1,
-            xanchor="left",
-            x=1.02
+    if len(available_years) > 0:
+        selected_year = st.selectbox(
+            "Select Year",
+            options=available_years,
+            index=0,
+            key="yearly_pie_year"
         )
-    )
-    
-    st.plotly_chart(fig_yearly, use_container_width=True)
+        
+        # Filter by selected year
+        df_year_filtered = df_yearly[df_yearly['Year'] == selected_year]
+        
+        # Calculate monthly totals per category
+        monthly_by_cat = df_year_filtered.groupby(['YearMonth', 'Category'])['Cost'].sum().reset_index()
+        
+        # Calculate average monthly spending per category
+        category_monthly_avg = monthly_by_cat.groupby('Category')['Cost'].mean().reset_index()
+        category_monthly_avg.columns = ['Category', 'Monthly Average']
+        category_monthly_avg = category_monthly_avg.sort_values('Monthly Average', ascending=False)
+        
+        fig_yearly_pie = px.pie(
+            category_monthly_avg,
+            values='Monthly Average',
+            names='Category',
+            title=f"Average Monthly Spending by Category - {selected_year}",
+            hole=0.4
+        )
+        
+        fig_yearly_pie.update_traces(
+            textposition='auto',
+            textinfo='percent+label'
+        )
+        
+        st.plotly_chart(fig_yearly_pie, use_container_width=True)
+    else:
+        st.info("No data available for yearly analysis")
     
     st.markdown("---")
     
@@ -1752,8 +1886,10 @@ def show_analytics(df):
     df_yoy['Year'] = df_yoy['Date'].dt.year
     df_yoy['Month'] = df_yoy['Date'].dt.month
     
-    monthly_totals = df_yoy.groupby(['Year', 'Month', 'Category'])['Cost'].sum().reset_index()
-    yoy_avg = monthly_totals.groupby(['Year', 'Category'])['Cost'].mean().reset_index()
+    # Calculate monthly totals using Cost
+    monthly_totals_yoy = df_yoy.groupby(['Year', 'Month', 'Category'])['Cost'].sum().reset_index()
+    monthly_totals_yoy.columns = ['Year', 'Month', 'Category', 'Total']
+    yoy_avg = monthly_totals_yoy.groupby(['Year', 'Category'])['Total'].mean().reset_index()
     yoy_avg.columns = ['Year', 'Category', 'Monthly Average']
     yoy_avg['Year'] = yoy_avg['Year'].astype(str)
     
@@ -1828,7 +1964,7 @@ def main():
     # Handle navigation from Manage button or restore after group switch
     if st.session_state.navigate_to_manage_groups:
         default_page = "Manage Groups"
-        st.session_state.navigate_to_manage_groups = False
+        # Clear the flag AFTER using it
     elif 'current_page' in st.session_state:
         default_page = st.session_state.current_page
     else:
@@ -1836,10 +1972,16 @@ def main():
     
     page_options = ["Overview", "Analytics", "Income & Savings", "Data Management", "Combined Analytics", "Manage Groups"]
     page = st.sidebar.radio("Select Page", page_options, 
-                           index=page_options.index(default_page) if default_page in page_options else 0)
+                           index=page_options.index(default_page) if default_page in page_options else 0,
+                           key="main_page_selector")
     
-    # Store current page selection
-    st.session_state.current_page = page
+    # Clear navigation flag after page is selected
+    if st.session_state.navigate_to_manage_groups:
+        st.session_state.navigate_to_manage_groups = False
+    
+    # Store current page selection only if it changed
+    if 'current_page' not in st.session_state or st.session_state.current_page != page:
+        st.session_state.current_page = page
     
     # Filters (if not on data management or income page)
     if page not in ["Data Management", "Income & Savings", "Combined Analytics", "Manage Groups"] and not df.empty:
