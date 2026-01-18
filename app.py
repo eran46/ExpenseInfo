@@ -7,6 +7,8 @@ import numpy as np
 import io
 import json
 from data_manager import DataManager
+from groups_manager import GroupsManager
+from user_expense_calculator import UserExpenseCalculator
 
 # Page configuration
 st.set_page_config(
@@ -15,15 +17,28 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize data manager
+# Initialize managers
 @st.cache_resource
-def get_data_manager():
-    """Singleton data manager"""
-    return DataManager()
+def get_groups_manager():
+    """Singleton groups manager"""
+    return GroupsManager()
+
+def get_data_manager(group_data_path=None):
+    """Get data manager for specific group or active group"""
+    if group_data_path is None:
+        groups_mgr = get_groups_manager()
+        if groups_mgr.has_groups():
+            active_group = groups_mgr.get_active_group()
+            group_data_path = groups_mgr.get_group_data_path(active_group['id'])
+    return DataManager(group_data_path)
 
 def convert_df_to_transactions(df):
-    """Convert DataFrame to transaction list"""
+    """Convert DataFrame to transaction list, preserving all columns including member splits"""
     transactions = []
+    
+    # Standard columns
+    standard_cols = ['Date', 'Description', 'Category', 'Cost', 'Currency']
+    
     for _, row in df.iterrows():
         txn = {
             'date': row['Date'].isoformat() if pd.notna(row['Date']) else None,
@@ -33,6 +48,14 @@ def convert_df_to_transactions(df):
             'currency': str(row['Currency']) if pd.notna(row['Currency']) else 'ILS',
             'source': 'import'
         }
+        
+        # Preserve all other columns (member splits, etc.)
+        for col in df.columns:
+            if col not in standard_cols and col not in txn:
+                # Add any non-standard column (like member names)
+                if pd.notna(row[col]):
+                    txn[col] = float(row[col]) if isinstance(row[col], (int, float)) else str(row[col])
+        
         transactions.append(txn)
     return transactions
 
@@ -78,6 +101,26 @@ def load_data_from_file(file, file_type):
         st.error(f"Error loading file: {str(e)}")
         return None
 
+def update_group_members_from_data(group_id: str, df: pd.DataFrame):
+    """Update group members list based on detected member columns in data"""
+    dm = get_data_manager()
+    member_cols = dm.get_member_columns(df)
+    
+    if member_cols:
+        groups_mgr = get_groups_manager()
+        group = groups_mgr.get_group_by_id(group_id)
+        
+        if group:
+            # Update members if they're not already set or are different
+            current_members = set(group.get('members', []))
+            new_members = set(member_cols)
+            
+            if current_members != new_members:
+                groups_mgr.update_group(group_id, members=list(new_members))
+                return list(new_members)
+    
+    return []
+
 def load_persisted_data():
     """Load data from persistence layer"""
     dm = get_data_manager()
@@ -89,10 +132,94 @@ def get_member_columns(df):
     member_cols = [col for col in df.columns if col not in standard_cols]
     return member_cols
 
+def is_reimbursement_transaction(row, member_cols):
+    """
+    Check if a transaction is a reimbursement (one person owed full amount).
+    In such transactions, one member has +Cost and others sum to -Cost.
+    Member sum (absolute) ≈ 2×Cost for 2 members, higher for more members.
+    """
+    if not member_cols:
+        return False
+    
+    cost = row['Cost']
+    if cost == 0:
+        return False
+    
+    # Calculate absolute sum of member values, handling non-numeric values
+    member_sum_abs = 0
+    for m in member_cols:
+        if m in row and pd.notna(row[m]):
+            try:
+                val = float(row[m])
+                member_sum_abs += abs(val)
+            except (ValueError, TypeError):
+                # Skip non-numeric values
+                continue
+    
+    # Calculate ratio
+    ratio = member_sum_abs / cost if cost > 0 else 0
+    
+    # For reimbursements, ratio should be approximately 2.0
+    # (one person has +cost, others sum to -cost, so abs sum = 2×cost)
+    return 1.9 < ratio < 2.1
+
 def exclude_payments(df):
     """Exclude Payment and Settlement categories from calculations"""
     exclude_categories = ['Payment', 'Settlement', 'payment', 'settlement']
     return df[~df['Category'].isin(exclude_categories)]
+
+def exclude_reimbursements(df):
+    """
+    Exclude reimbursement transactions where one person is owed the full amount.
+    These are internal transfers, not real household expenses.
+    """
+    if df.empty:
+        return df
+    
+    # Get member columns
+    dm = get_data_manager()
+    member_cols = dm.get_member_columns(df)
+    
+    if not member_cols:
+        return df
+    
+    # Filter out reimbursement transactions
+    mask = ~df.apply(lambda row: is_reimbursement_transaction(row, member_cols), axis=1)
+    return df[mask]
+
+def exclude_payments_and_reimbursements(df):
+    """Exclude both Payment/Settlement categories and reimbursement transactions"""
+    df = exclude_payments(df)
+    df = exclude_reimbursements(df)
+    return df
+
+def calculate_total_spending(df):
+    """
+    Calculate Total Spending as the sum of all member expenses (what they actually paid).
+    This matches the sum of all members' "Total Personal Expense" values.
+    
+    Returns the sum of positive member values (what members actually paid out).
+    """
+    if df.empty:
+        return 0.0
+    
+    # Get member columns
+    dm = get_data_manager()
+    member_cols = dm.get_member_columns(df)
+    
+    if not member_cols:
+        return 0.0
+    
+    # Sum all positive values (what members paid)
+    total = 0.0
+    for member_col in member_cols:
+        if member_col in df.columns:
+            # Sum only positive values (payments made) - convert to numeric first
+            member_values = pd.to_numeric(df[member_col], errors='coerce').fillna(0)
+            positive_values = member_values[member_values > 0].sum()
+            total += positive_values
+    
+    return total
 
 # Income calculation functions
 def normalize_to_monthly(amount, frequency):
@@ -125,6 +252,152 @@ def get_total_monthly_income(income_entries, as_of_date=None):
     
     return total
 
+def render_group_selector():
+    """Render group selector in sidebar"""
+    groups_mgr = get_groups_manager()
+    
+    # Check if groups exist
+    if not groups_mgr.has_groups():
+        return
+    
+    groups = groups_mgr.get_all_groups()
+    active_group = groups_mgr.get_active_group()
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📁 Expense Groups")
+    
+    # Group dropdown
+    group_display = [f"{g['emoji']} {g['name']}" for g in groups]
+    group_ids = [g['id'] for g in groups]
+    
+    try:
+        current_index = group_ids.index(active_group['id'])
+    except (ValueError, KeyError):
+        current_index = 0
+        groups_mgr.set_active_group(group_ids[0])
+    
+    selected_display = st.sidebar.selectbox(
+        "Select Group",
+        group_display,
+        index=current_index,
+        key="group_selector"
+    )
+    
+    selected_index = group_display.index(selected_display)
+    selected_id = group_ids[selected_index]
+    
+    # Handle group switching
+    if selected_id != active_group['id']:
+        # Store current page before switching
+        if 'current_page' not in st.session_state:
+            st.session_state.current_page = 'Overview'
+        
+        groups_mgr.set_active_group(selected_id)
+        st.cache_data.clear()
+        st.rerun()
+    
+    # Quick actions
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        if st.button("➕ New", use_container_width=True, key="new_group_btn"):
+            st.session_state.show_new_group_modal = True
+            st.rerun()
+    with col2:
+        if st.button("⚙️ Manage", use_container_width=True, key="manage_groups_btn"):
+            st.session_state.navigate_to_manage_groups = True
+            st.rerun()
+
+def render_member_filter(df):
+    """Add member filter to sidebar for group data"""
+    if df.empty:
+        return df, None
+    
+    dm = get_data_manager()
+    member_cols = dm.get_member_columns(df)
+    
+    if not member_cols:
+        return df, None
+    
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("👤 Member Filter")
+    
+    filter_mode = st.sidebar.radio(
+        "View",
+        options=["All Transactions", "Individual Member"],
+        key="member_filter_mode"
+    )
+    
+    if filter_mode == "Individual Member":
+        selected_member = st.sidebar.selectbox(
+            "Select Member",
+            options=member_cols,
+            key="selected_member"
+        )
+        
+        # Filter to transactions where member is involved
+        filtered_df = dm.get_member_transactions(df, selected_member, exclude_zero=True)
+        
+        # Show member's stats
+        st.sidebar.markdown(f"**{selected_member}'s Stats:**")
+        stats = dm.calculate_member_expenses(filtered_df, selected_member)
+        
+        if stats:
+            st.sidebar.metric("Personal Expense", f"₪{stats['total_paid']:,.2f}")
+            st.sidebar.metric("Owed to You", f"₪{stats['total_owed_to_them']:,.2f}")
+            balance_label = "You Owe" if stats['net_balance'] > 0 else "Owed to You"
+            st.sidebar.metric(balance_label, f"₪{abs(stats['net_balance']):,.2f}")
+        
+        return filtered_df, selected_member
+    
+    return df, None
+
+def show_new_group_modal():
+    """Modal for creating new group"""
+    st.subheader("➕ Create New Group")
+    
+    with st.form("new_group_form"):
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            group_name = st.text_input("Group Name *", placeholder="e.g., Wedding Expenses")
+        
+        with col2:
+            group_emoji = st.text_input("Emoji", value="📁", max_chars=2)
+        
+        group_description = st.text_area(
+            "Description",
+            placeholder="Brief description of this expense group"
+        )
+        
+        members_input = st.text_input(
+            "Members (comma-separated)",
+            placeholder="e.g., Person 1, Person 2"
+        )
+        
+        submitted = st.form_submit_button("Create Group", type="primary")
+        
+        if submitted:
+            if not group_name:
+                st.error("Group name is required")
+            else:
+                groups_mgr = get_groups_manager()
+                members = [m.strip() for m in members_input.split(',')] if members_input else []
+                
+                new_group = groups_mgr.create_group(
+                    name=group_name,
+                    description=group_description,
+                    emoji=group_emoji,
+                    members=members
+                )
+                
+                st.success(f"✅ Created group: {group_emoji} {group_name}")
+                st.session_state.show_new_group_modal = False
+                
+                # Switch to new group
+                groups_mgr.set_active_group(new_group['id'])
+                st.cache_data.clear()
+                st.rerun()
+
 def show_setup_wizard():
     """First-time setup wizard"""
     st.title("👋 Welcome to streamlit-splitwise-dashboard !")
@@ -155,6 +428,12 @@ def show_setup_wizard():
                         transactions = convert_df_to_transactions(df)
                         result = dm.append_transactions(transactions)
                         
+                        # Update group members if groups exist
+                        groups_mgr = get_groups_manager()
+                        if groups_mgr.has_groups():
+                            active_group = groups_mgr.get_active_group()
+                            update_group_members_from_data(active_group['id'], df)
+                        
                         st.success(f"✅ Successfully imported {result['added']} transactions!")
                         if result['skipped'] > 0:
                             st.info(f"ℹ️ Skipped {result['skipped']} duplicate transactions")
@@ -181,11 +460,40 @@ def show_data_management():
     """Data management page"""
     st.title("💾 Data Management")
     
-    dm = get_data_manager()
+    # Group selector at the top
+    groups_mgr = get_groups_manager()
+    groups = groups_mgr.get_all_groups()
+    
+    if not groups:
+        st.warning("No groups available. Create a group in the Manage Groups page first.")
+        return
+    
+    # Get current active group
+    active_group = groups_mgr.get_active_group()
+    active_group_id = active_group['id'] if active_group else groups[0]['id']
+    
+    # Find index of active group for default selection
+    default_index = next((i for i, g in enumerate(groups) if g['id'] == active_group_id), 0)
+    
+    # Group selector
+    st.markdown("### 📁 Select Group for Data Management")
+    selected_group = st.selectbox(
+        "Choose which group's data to manage:",
+        options=groups,
+        format_func=lambda g: f"{g['emoji']} {g['name']}",
+        index=default_index,
+        key="data_mgmt_group_selector"
+    )
+    
+    # Get data manager for the selected group
+    group_path = groups_mgr.get_group_data_path(selected_group['id'])
+    dm = DataManager(group_path)
     data = dm.load_data()
     
+    st.markdown("---")
+    
     # Current dataset info
-    st.subheader("📊 Current Dataset")
+    st.subheader(f"📊 Current Dataset - {selected_group['emoji']} {selected_group['name']}")
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
@@ -243,7 +551,12 @@ def show_data_management():
                     transactions = convert_df_to_transactions(df)
                     result = dm.append_transactions(transactions)
                     
-                    st.success(f"✅ Added {result['added']} new transactions")
+                    # Update group members from uploaded data
+                    updated_members = update_group_members_from_data(selected_group['id'], df)
+                    if updated_members:
+                        st.info(f"📝 Updated group members: {', '.join(updated_members)}")
+                    
+                    st.success(f"✅ Added {result['added']} new transactions to {selected_group['emoji']} {selected_group['name']}")
                     
                     if result['skipped'] > 0:
                         st.warning(f"⚠️ Skipped {result['skipped']} duplicate transactions")
@@ -360,22 +673,46 @@ def show_data_management():
 
 def show_overview(df):
     """Show overview page with summary and charts"""
-    # Exclude payments for metrics
-    df_expenses = exclude_payments(df)
+    # Calculate Total Spending as sum of member expenses (NO exclusions - matches Combined Analytics)
+    total_spending = calculate_total_spending(df)
     
-    # Calculate metrics
-    total_spending = df_expenses['Cost'].sum()
+    # Get expenses dataframe for plots (exclude Payment and reimbursements for display)
+    df_expenses = exclude_payments_and_reimbursements(df)
     
-    # Historic monthly average
-    df_expenses_copy = df_expenses.copy()
-    df_expenses_copy['YearMonth'] = df_expenses_copy['Date'].dt.to_period('M')
-    monthly_totals = df_expenses_copy.groupby('YearMonth')['Cost'].sum()
-    historic_avg = monthly_totals.mean() if len(monthly_totals) > 0 else 0
+    # Get member columns for calculations
+    dm = get_data_manager()
+    member_cols = dm.get_member_columns(df) if not df.empty else []
     
-    # Current month spending
+    # Historic monthly average - use member expenses (no exclusions)
+    if not df.empty and member_cols:
+        df_copy = df.copy()
+        df_copy['YearMonth'] = df_copy['Date'].dt.to_period('M')
+        
+        # Calculate monthly totals as sum of member expenses
+        monthly_data = []
+        for year_month, group in df_copy.groupby('YearMonth'):
+            month_total = 0.0
+            for member_col in member_cols:
+                if member_col in group.columns:
+                    member_values = pd.to_numeric(group[member_col], errors='coerce').fillna(0)
+                    month_total += member_values[member_values > 0].sum()
+            monthly_data.append({'YearMonth': year_month, 'Total': month_total})
+        
+        if monthly_data:
+            monthly_df = pd.DataFrame(monthly_data)
+            historic_avg = monthly_df['Total'].mean()
+        else:
+            historic_avg = 0
+    else:
+        historic_avg = 0
+    
+    # Current month spending - use Cost from filtered data (matches Trends & History tab)
     current_month = datetime.now().replace(day=1).date()
     current_month_data = df_expenses[df_expenses['Date'].dt.date >= current_month]
-    current_month_spending = current_month_data['Cost'].sum()
+    if not current_month_data.empty:
+        current_month_spending = current_month_data['Cost'].sum()
+    else:
+        current_month_spending = 0
     
     # Get income data
     dm = get_data_manager()
@@ -479,12 +816,14 @@ def show_overview(df):
                 title = f'Spending by Category ({selected_month})'
             
             if not filtered_df.empty:
+                # Calculate category totals using Cost (for plots only)
                 category_totals = filtered_df.groupby('Category')['Cost'].sum().reset_index()
-                category_totals = category_totals.sort_values('Cost', ascending=False)
+                category_totals.columns = ['Category', 'Total']
+                category_totals = category_totals.sort_values('Total', ascending=False)
                 
                 fig_pie = px.pie(
                     category_totals,
-                    values='Cost',
+                    values='Total',
                     names='Category',
                     title=title,
                     hole=0.4
@@ -508,9 +847,10 @@ def show_overview(df):
                 
                 st.plotly_chart(fig_pie, use_container_width=True)
                 
-                # Show total for selected period
-                total = category_totals['Cost'].sum()
-                st.metric(f"Total Spending ({selected_month})", f"₪{total:,.0f}")
+                # Show total for selected period (this is for filtered expenses only)
+                total = category_totals['Total'].sum()
+                st.metric(f"Expenses Shown in Chart ({selected_month})", f"₪{total:,.0f}",
+                         help="This shows expenses excluding Payment category and reimbursements")
             else:
                 st.info(f"No expense data available for {selected_month}")
         else:
@@ -518,6 +858,7 @@ def show_overview(df):
     
     with tab2:
         if not df_expenses.empty:
+            # Calculate monthly spending using Cost (excluding Payment & reimbursements)
             df_timeline = df_expenses.copy()
             df_timeline['YearMonth'] = df_timeline['Date'].dt.to_period('M').astype(str)
             
@@ -594,7 +935,7 @@ def show_income_tracking():
                     (df['Date'].dt.year == now.year) & 
                     (df['Date'].dt.month == now.month)
                 ]
-                df_expenses = exclude_payments(current_month_df)
+                df_expenses = exclude_payments_and_reimbursements(current_month_df)
                 monthly_expenses = df_expenses['Cost'].sum()
                 
                 if total_monthly_income > 0:
@@ -898,11 +1239,525 @@ def show_income_entry_modal(dm, edit_id=None):
             st.session_state['edit_income_id'] = None
             st.rerun()
 
+def show_combined_analytics():
+    """Combined analytics across multiple groups"""
+    st.title("📊 Combined Groups Analytics")
+    
+    groups_mgr = get_groups_manager()
+    groups = groups_mgr.get_all_groups()
+    
+    if not groups:
+        st.warning("No groups available. Create a group first.")
+        return
+    
+    # Multi-select for groups
+    selected_group_ids = st.multiselect(
+        "Select Groups to Analyze",
+        options=[g['id'] for g in groups],
+        format_func=lambda gid: f"{next((g['emoji'] for g in groups if g['id']==gid), '📁')} {next((g['name'] for g in groups if g['id']==gid), 'Unknown')}",
+        default=[groups[0]['id']]
+    )
+    
+    if not selected_group_ids:
+        st.warning("Please select at least one group to view analytics")
+        return
+    
+    # Load data from selected groups
+    all_data = []
+    for group_id in selected_group_ids:
+        group = next((g for g in groups if g['id'] == group_id), None)
+        if not group:
+            continue
+        
+        group_path = groups_mgr.get_group_data_path(group_id)
+        dm = DataManager(group_path)
+        df = dm.get_dataframe()
+        
+        if not df.empty:
+            df['Group'] = group['name']
+            df['GroupEmoji'] = group['emoji']
+            all_data.append(df)
+    
+    if not all_data:
+        st.info("No data available in selected groups")
+        return
+    
+    combined_df_original = pd.concat(all_data, ignore_index=True)
+    
+    # For plots, exclude Payment/Settlement and reimbursement transactions (same as Overview)
+    combined_df = exclude_payments_and_reimbursements(combined_df_original)
+    
+    # Get all members across selected groups
+    all_members = groups_mgr.get_all_members_across_groups(selected_group_ids)
+    
+    # Member view mode
+    st.markdown("---")
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        view_mode = st.radio(
+            "View Mode",
+            options=["All Group Expenses", "Individual Member View"],
+            horizontal=True
+        )
+    
+    selected_member = None
+    if view_mode == "Individual Member View":
+        with col2:
+            if all_members:
+                selected_member = st.selectbox("Select Member", options=all_members)
+    
+    st.markdown("---")
+    
+    # Calculate metrics based on view mode
+    if view_mode == "All Group Expenses":
+        # Month filter for all plots (except timeline)
+        combined_df_filtered = combined_df.copy()
+        combined_df_filtered['YearMonth'] = combined_df_filtered['Date'].dt.to_period('M')
+        available_months_all = sorted(combined_df_filtered['YearMonth'].unique(), reverse=True)
+        
+        month_options_all = ['All Time'] + [str(m) for m in available_months_all]
+        selected_month_all = st.selectbox(
+            "Filter by Month",
+            options=month_options_all,
+            key="combined_all_month_filter"
+        )
+        
+        # Apply month filter if selected
+        if selected_month_all != 'All Time':
+            combined_df_filtered = combined_df_filtered[combined_df_filtered['YearMonth'] == pd.Period(selected_month_all)]
+        
+        # Show metrics for all expenses
+        col1, col2, col3, col4 = st.columns(4)
+        
+        # Calculate Total Spent as sum of member expenses from ORIGINAL unfiltered data (matches Overview ₪222k)
+        dm = get_data_manager()
+        member_cols = dm.get_member_columns(combined_df_original) if not combined_df_original.empty else []
+        
+        total_spent = 0.0
+        if member_cols:
+            for member_col in member_cols:
+                if member_col in combined_df_original.columns:
+                    # Convert to numeric to avoid string comparison errors
+                    member_values = pd.to_numeric(combined_df_original[member_col], errors='coerce').fillna(0)
+                    total_spent += member_values[member_values > 0].sum()
+        
+        with col1:
+            st.metric("Total Groups", len(selected_group_ids))
+        with col2:
+            st.metric("Total Transactions", len(combined_df_filtered))
+        with col3:
+            st.metric("Total Spent", f"₪{total_spent:,.2f}")
+        with col4:
+            if not combined_df_filtered.empty:
+                date_range_str = f"{combined_df_filtered['Date'].min().date()} to {combined_df_filtered['Date'].max().date()}"
+            else:
+                date_range_str = "No data"
+            st.metric("Date Range", date_range_str)
+        
+        # Visualizations
+        st.markdown("---")
+        
+        # For plots, exclude Payment and reimbursements
+        combined_df_for_plots = exclude_payments_and_reimbursements(combined_df_filtered)
+        
+        # Spending by group
+        st.subheader("💰 Spending by Group")
+        
+        # Calculate spending by group using Cost
+        group_spending = combined_df_for_plots.groupby(['Group', 'GroupEmoji'])['Cost'].sum().reset_index()
+        group_spending.columns = ['Group', 'GroupEmoji', 'Total']
+        group_spending['Display'] = group_spending['GroupEmoji'] + ' ' + group_spending['Group']
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            fig_pie = px.pie(
+                group_spending,
+                values='Total',
+                names='Display',
+                title=f'Spending Distribution by Group{" - " + selected_month_all if selected_month_all != "All Time" else ""}'
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+        
+        with col2:
+            fig_bar = px.bar(
+                group_spending,
+                x='Display',
+                y='Total',
+                title=f'Total Spending by Group{" - " + selected_month_all if selected_month_all != "All Time" else ""}'
+            )
+            st.plotly_chart(fig_bar, use_container_width=True)
+        
+        # Category breakdown
+        st.subheader("📊 Category Breakdown Across Groups")
+        
+        # Calculate category totals using Cost
+        category_data = combined_df_for_plots.groupby('Category')['Cost'].sum().reset_index()
+        category_data.columns = ['Category', 'Total']
+        category_data = category_data.sort_values('Total', ascending=False).head(10)
+        
+        fig_categories = px.bar(
+            category_data,
+            x='Category',
+            y='Total',
+            color='Category',
+            title=f'Top 10 Categories Across All Groups{" - " + selected_month_all if selected_month_all != "All Time" else ""}'
+        )
+        st.plotly_chart(fig_categories, use_container_width=True)
+        
+        # Timeline
+        st.subheader("📈 Timeline Across Groups")
+        
+        # Calculate timeline data using Cost (Payment/reimbursements already excluded in combined_df)
+        combined_df_timeline = combined_df.copy()
+        combined_df_timeline['YearMonth'] = combined_df_timeline['Date'].dt.to_period('M').astype(str)
+        
+        timeline_data = combined_df_timeline.groupby(['YearMonth', 'Group'])['Cost'].sum().reset_index()
+        timeline_data.columns = ['YearMonth', 'Group', 'Total']
+        
+        fig_timeline = px.line(
+            timeline_data,
+            x='YearMonth',
+            y='Total',
+            color='Group',
+            title='Monthly Spending by Group'
+        )
+        st.plotly_chart(fig_timeline, use_container_width=True)
+    
+    else:
+        # Individual member view
+        if not selected_member:
+            st.warning("Please select a member")
+            return
+        
+        user_calc = UserExpenseCalculator(groups_mgr)
+        member_data = user_calc.calculate_user_total_expense(selected_group_ids, selected_member)
+        
+        # Month filter for individual member view - at the top
+        member_txns = member_data.get('transactions', [])
+        selected_month_member = 'All Time'
+        
+        if member_txns and len(member_txns) > 0:
+            member_txns_df_filter = pd.DataFrame(member_txns)
+            
+            if 'date' in member_txns_df_filter.columns:
+                member_txns_df_filter['date'] = pd.to_datetime(member_txns_df_filter['date'])
+                member_txns_df_filter['YearMonth'] = member_txns_df_filter['date'].dt.to_period('M')
+                available_months_member = sorted(member_txns_df_filter['YearMonth'].unique(), reverse=True)
+                
+                month_options_member = ['All Time'] + [str(m) for m in available_months_member]
+                selected_month_member = st.selectbox(
+                    "Filter by Month",
+                    options=month_options_member,
+                    key="member_all_month_filter"
+                )
+        
+        # Calculate how much they're owed FROM or owe TO everyone else
+        all_members_data = user_calc.calculate_all_members_expenses(selected_group_ids)
+        
+        # For this member, calculate total debt to/from ALL other members
+        total_debt_to_member = 0  # How much others owe to this member
+        total_debt_from_member = 0  # How much this member owes to others
+        
+        for other_member, other_data in all_members_data.items():
+            if other_member != selected_member:
+                # If other member has negative balance, they owe money
+                # If this member should receive that money, add to debt_to_member
+                # This is approximate - real debt tracking needs transaction-level analysis
+                other_balance = other_data['net_balance']
+                if other_balance < 0:  # Other person owes
+                    # They might owe to our member
+                    pass  # Skip for now, use simple net balance
+        
+        # Simplified: just show net balance from member's perspective
+        # Member metrics - removed redundant Total Owed By Them
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Total Personal Expense", f"₪{member_data['total_expense']:,.2f}", 
+                     help="Total amount this person actually paid")
+        with col2:
+            net_balance = member_data['net_balance']
+            if net_balance > 0:
+                # Positive net = paid more than owed = they are OWED money
+                balance_label = "They Are Owed"
+                balance_help = "This person is owed money (paid more than their share)"
+            elif net_balance < 0:
+                # Negative net = owed more than paid = they OWE money
+                balance_label = "They Owe"
+                balance_help = "This person owes money (paid less than their share)"
+            else:
+                balance_label = "Balanced"
+                balance_help = "This person is settled up"
+            st.metric(balance_label, f"₪{abs(net_balance):,.2f}",
+                     help=balance_help)
+        
+        st.markdown("---")
+        
+        # Category breakdown for member
+        st.subheader(f"📊 {selected_member}'s Expense Breakdown")
+        
+        # Get member transactions for month filtering
+        if member_txns and len(member_txns) > 0:
+            member_txns_df = pd.DataFrame(member_txns)
+            
+            # Check if date column exists and convert
+            if 'date' in member_txns_df.columns:
+                member_txns_df['date'] = pd.to_datetime(member_txns_df['date'])
+                member_txns_df['YearMonth'] = member_txns_df['date'].dt.to_period('M')
+                
+                # Apply month filter if selected
+                if selected_month_member != 'All Time':
+                    member_txns_df = member_txns_df[member_txns_df['YearMonth'] == pd.Period(selected_month_member)]
+                
+                # Recalculate category data from filtered transactions using Cost
+                category_data = {}
+                for _, row in member_txns_df.iterrows():
+                    total_cost = row.get('total_cost', 0)
+                    try:
+                        total_cost = float(total_cost)
+                        if total_cost > 0:
+                            category = row.get('category', 'Uncategorized')
+                            category_data[category] = category_data.get(category, 0) + total_cost
+                    except (ValueError, TypeError):
+                        continue
+            else:
+                category_data = user_calc.get_member_expense_by_category(selected_group_ids, selected_member)
+        else:
+            category_data = user_calc.get_member_expense_by_category(selected_group_ids, selected_member)
+        
+        if category_data:
+            df_categories = pd.DataFrame([
+                {'Category': cat, 'Amount': amt}
+                for cat, amt in category_data.items()
+            ]).sort_values('Amount', ascending=False)
+            
+            fig_pie = px.pie(
+                df_categories,
+                values='Amount',
+                names='Category',
+                title=f'{selected_member} - Spending by Category{" - " + selected_month_member if selected_month_member != "All Time" else ""}'
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+        
+        # Spending by group for this member
+        st.subheader(f"{selected_member}'s Spending by Group")
+        
+        # Apply month filter to group spending if available
+        if member_txns and len(member_txns) > 0:
+            member_txns_df_group = pd.DataFrame(member_txns)
+            
+            if 'date' in member_txns_df_group.columns and selected_month_member != 'All Time':
+                member_txns_df_group['date'] = pd.to_datetime(member_txns_df_group['date'])
+                member_txns_df_group['YearMonth'] = member_txns_df_group['date'].dt.to_period('M')
+                member_txns_df_group = member_txns_df_group[member_txns_df_group['YearMonth'] == pd.Period(selected_month_member)]
+                
+                # Recalculate group breakdown from filtered transactions using Cost
+                group_breakdown = {}
+                for _, row in member_txns_df_group.iterrows():
+                    group_name = row.get('group_name', 'Unknown')
+                    total_cost = row.get('total_cost', 0)
+                    try:
+                        total_cost = float(total_cost)
+                        if total_cost > 0:
+                            group_breakdown[group_name] = group_breakdown.get(group_name, 0) + total_cost
+                    except (ValueError, TypeError):
+                        continue
+            else:
+                # No month filter, calculate from all groups
+                group_breakdown = {}
+                for group_id in selected_group_ids:
+                    group = next((g for g in groups if g['id'] == group_id), None)
+                    if group:
+                        member_stats = user_calc.calculate_user_total_expense([group_id], selected_member)
+                        group_breakdown[f"{group['emoji']} {group['name']}"] = member_stats['total_expense']
+        else:
+            group_breakdown = {}
+            for group_id in selected_group_ids:
+                group = next((g for g in groups if g['id'] == group_id), None)
+                if group:
+                    member_stats = user_calc.calculate_user_total_expense([group_id], selected_member)
+                    group_breakdown[f"{group['emoji']} {group['name']}"] = member_stats['total_expense']
+        
+        df_groups = pd.DataFrame([
+            {'Group': name, 'Amount': amt}
+            for name, amt in group_breakdown.items()
+        ])
+        
+        if not df_groups.empty:
+            fig_group_bar = px.bar(
+                df_groups,
+                x='Group',
+                y='Amount',
+                title=f'{selected_member} - Spending by Group{" - " + selected_month_member if selected_month_member != "All Time" else ""}'
+            )
+            st.plotly_chart(fig_group_bar, use_container_width=True)
+        
+        # Transaction list
+        st.subheader(f"{selected_member}'s Transactions")
+        member_txns = member_data['transactions']
+        
+        if member_txns:
+            df_txns = pd.DataFrame(member_txns)
+            df_display = df_txns[['date', 'group_name', 'description', 'category', 
+                                  'total_cost', 'member_share']].copy()
+            df_display.columns = ['Date', 'Group', 'Description', 'Category', 
+                                 'Total Cost', 'Your Share']
+            df_display = df_display.sort_values('Date', ascending=False)
+            
+            st.dataframe(df_display, use_container_width=True, hide_index=True)
+            
+            # Export option
+            csv = df_display.to_csv(index=False)
+            st.download_button(
+                label=f"📥 Download {selected_member}'s Transactions",
+                data=csv,
+                file_name=f"{selected_member}_expenses.csv",
+                mime="text/csv"
+            )
+
+def show_manage_groups_page():
+    """Manage groups page"""
+    st.title("⚙️ Manage Groups")
+    
+    groups_mgr = get_groups_manager()
+    groups = groups_mgr.get_all_groups()
+    
+    if not groups:
+        st.info("No groups yet. Create your first group!")
+        show_new_group_modal()
+        return
+    
+    # Handle group editing
+    if 'editing_group_id' in st.session_state and st.session_state.editing_group_id:
+        group_to_edit = next((g for g in groups if g['id'] == st.session_state.editing_group_id), None)
+        if group_to_edit:
+            st.subheader(f"✏️ Edit Group: {group_to_edit['name']}")
+            
+            with st.form(f"edit_group_{group_to_edit['id']}"):
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    new_name = st.text_input("Group Name", value=group_to_edit['name'])
+                
+                with col2:
+                    new_emoji = st.text_input("Emoji", value=group_to_edit.get('emoji', '📁'), max_chars=2)
+                
+                new_description = st.text_area(
+                    "Description",
+                    value=group_to_edit.get('description', '')
+                )
+                
+                current_members = ', '.join(group_to_edit.get('members', []))
+                new_members_input = st.text_input(
+                    "Members (comma-separated)",
+                    value=current_members
+                )
+                
+                col_save, col_cancel = st.columns(2)
+                
+                with col_save:
+                    if st.form_submit_button("💾 Save Changes", type="primary"):
+                        new_members = [m.strip() for m in new_members_input.split(',')] if new_members_input else []
+                        
+                        groups_mgr.update_group(
+                            group_to_edit['id'],
+                            name=new_name,
+                            emoji=new_emoji,
+                            description=new_description,
+                            members=new_members
+                        )
+                        
+                        st.success("✅ Group updated!")
+                        st.session_state.editing_group_id = None
+                        st.rerun()
+                
+                with col_cancel:
+                    if st.form_submit_button("❌ Cancel"):
+                        st.session_state.editing_group_id = None
+                        st.rerun()
+            
+            st.markdown("---")
+    
+    # Display groups
+    st.subheader("📁 Your Groups")
+    
+    for group in groups:
+        with st.expander(f"{group['emoji']} {group['name']}", expanded=False):
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.markdown(f"**Description:** {group.get('description', 'No description')}")
+                
+                members = group.get('members', [])
+                if members:
+                    st.markdown(f"**Members:** {', '.join(members)}")
+                else:
+                    st.markdown("**Members:** None")
+                
+                # Load stats
+                group_path = groups_mgr.get_group_data_path(group['id'])
+                dm = DataManager(group_path)
+                df = dm.get_dataframe()
+                
+                if not df.empty:
+                    total_txns = len(df)
+                    total_cost = exclude_payments_and_reimbursements(df)['Cost'].sum()
+                    st.markdown(f"**Transactions:** {total_txns}")
+                    st.markdown(f"**Total Spent:** ₪{total_cost:,.2f}")
+                else:
+                    st.markdown("**Transactions:** 0")
+                    st.markdown("**Total Spent:** ₪0.00")
+                
+                created_at = group.get('created_at', '')
+                if created_at:
+                    st.markdown(f"**Created:** {created_at[:10]}")
+            
+            with col2:
+                is_active = group['id'] == groups_mgr.get_active_group()['id']
+                
+                if st.button("👁️ View", key=f"view_{group['id']}", use_container_width=True, disabled=is_active):
+                    groups_mgr.set_active_group(group['id'])
+                    st.cache_data.clear()
+                    st.session_state.navigate_to_overview = True
+                    st.rerun()
+                
+                if st.button("✏️ Edit", key=f"edit_{group['id']}", use_container_width=True):
+                    st.session_state.editing_group_id = group['id']
+                    st.rerun()
+                
+                if is_active:
+                    st.success("✓ Active")
+                
+                if len(groups) > 1 and not is_active:
+                    if st.button("🗑️ Delete", key=f"delete_{group['id']}", use_container_width=True):
+                        st.session_state.confirm_delete_group = group['id']
+                        st.rerun()
+    
+    # Delete confirmation
+    if 'confirm_delete_group' in st.session_state and st.session_state.confirm_delete_group:
+        group_to_delete = next((g for g in groups if g['id'] == st.session_state.confirm_delete_group), None)
+        if group_to_delete:
+            st.warning(f"⚠️ Are you sure you want to delete '{group_to_delete['name']}'? This will delete all data in this group!")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Yes, Delete", type="primary", key="confirm_delete_yes"):
+                    groups_mgr.delete_group(group_to_delete['id'])
+                    st.session_state.confirm_delete_group = None
+                    st.success("Group deleted!")
+                    st.rerun()
+            with col2:
+                if st.button("Cancel", key="confirm_delete_cancel"):
+                    st.session_state.confirm_delete_group = None
+                    st.rerun()
+
 def show_analytics(df):
     """Show analytics page with detailed charts"""
     st.header("📊 Analytics")
     
-    df_all_expenses = exclude_payments(df)
+    df_all_expenses = exclude_payments_and_reimbursements(df)
     
     if df_all_expenses.empty:
         st.info("No expense data available for analysis")
@@ -922,12 +1777,15 @@ def show_analytics(df):
         df_monthly = df_monthly[df_monthly['Category'] == selected_category_monthly]
     
     df_monthly['YearMonth'] = df_monthly['Date'].dt.to_period('M').astype(str)
+    
+    # Calculate monthly totals using Cost
     monthly_totals = df_monthly.groupby(['YearMonth', 'Category'])['Cost'].sum().reset_index()
+    monthly_totals.columns = ['YearMonth', 'Category', 'Total']
     
     fig_monthly = px.bar(
         monthly_totals,
         x='YearMonth',
-        y='Cost',
+        y='Total',
         color='Category',
         title=f"Monthly Spending - {selected_category_monthly}",
         barmode='stack'
@@ -949,49 +1807,58 @@ def show_analytics(df):
     
     st.markdown("---")
     
-    # Yearly spending by category
-    st.subheader("Yearly Spending by Category")
-    selected_category_yearly = st.selectbox(
-        "Select Category",
-        options=categories,
-        key="yearly_category"
-    )
+    # Yearly spending by category - Monthly Average Pie Chart
+    st.subheader("Monthly Average Spending by Category")
     
     df_yearly = df_all_expenses.copy()
-    if selected_category_yearly != 'All Categories':
-        df_yearly = df_yearly[df_yearly['Category'] == selected_category_yearly]
+    df_yearly['Year'] = df_yearly['Date'].dt.year
+    df_yearly['YearMonth'] = df_yearly['Date'].dt.to_period('M')
     
-    df_yearly['Year'] = df_yearly['Date'].dt.year.astype(str)
-    yearly_totals = df_yearly.groupby(['Year', 'Category'])['Cost'].sum().reset_index()
+    # Get available years
+    available_years = sorted(df_yearly['Year'].unique(), reverse=True)
     
-    fig_yearly = px.bar(
-        yearly_totals,
-        x='Year',
-        y='Cost',
-        color='Category',
-        title=f"Yearly Spending - {selected_category_yearly}",
-        barmode='stack'
-    )
-    
-    fig_yearly.update_layout(
-        xaxis_title="Year",
-        yaxis_title="Amount (₪)",
-        xaxis_type='category',
-        legend=dict(
-            orientation="v",
-            yanchor="top",
-            y=1,
-            xanchor="left",
-            x=1.02
+    if len(available_years) > 0:
+        selected_year = st.selectbox(
+            "Select Year",
+            options=available_years,
+            index=0,
+            key="yearly_pie_year"
         )
-    )
-    
-    st.plotly_chart(fig_yearly, use_container_width=True)
+        
+        # Filter by selected year
+        df_year_filtered = df_yearly[df_yearly['Year'] == selected_year]
+        
+        # Calculate monthly totals per category
+        monthly_by_cat = df_year_filtered.groupby(['YearMonth', 'Category'])['Cost'].sum().reset_index()
+        
+        # Calculate average monthly spending per category
+        category_monthly_avg = monthly_by_cat.groupby('Category')['Cost'].mean().reset_index()
+        category_monthly_avg.columns = ['Category', 'Monthly Average']
+        category_monthly_avg = category_monthly_avg.sort_values('Monthly Average', ascending=False)
+        
+        fig_yearly_pie = px.pie(
+            category_monthly_avg,
+            values='Monthly Average',
+            names='Category',
+            title=f"Average Monthly Spending by Category - {selected_year}",
+            hole=0.4
+        )
+        
+        fig_yearly_pie.update_traces(
+            textposition='auto',
+            textinfo='percent+label'
+        )
+        
+        st.plotly_chart(fig_yearly_pie, use_container_width=True)
+    else:
+        st.info("No data available for yearly analysis")
     
     st.markdown("---")
     
     # Year-over-Year analysis
     st.subheader("Year-over-Year Monthly Average")
+    
+    # Category selector
     selected_category_yoy = st.selectbox(
         "Select Category",
         options=categories,
@@ -1004,56 +1871,134 @@ def show_analytics(df):
     
     df_yoy['Year'] = df_yoy['Date'].dt.year
     df_yoy['Month'] = df_yoy['Date'].dt.month
+    df_yoy['YearMonth'] = df_yoy['Date'].dt.to_period('M').astype(str)
     
-    monthly_totals = df_yoy.groupby(['Year', 'Month', 'Category'])['Cost'].sum().reset_index()
-    yoy_avg = monthly_totals.groupby(['Year', 'Category'])['Cost'].mean().reset_index()
-    yoy_avg.columns = ['Year', 'Category', 'Monthly Average']
-    yoy_avg['Year'] = yoy_avg['Year'].astype(str)
+    # Calculate monthly totals using Cost
+    monthly_totals_yoy = df_yoy.groupby(['YearMonth', 'Year', 'Month', 'Category'])['Cost'].sum().reset_index()
+    monthly_totals_yoy.columns = ['YearMonth', 'Year', 'Month', 'Category', 'Total']
     
-    fig_yoy = px.line(
-        yoy_avg,
-        x='Year',
-        y='Monthly Average',
-        color='Category',
-        title=f"Monthly Average by Category (Year-over-Year) - {selected_category_yoy}",
-        markers=True
-    )
-    
-    fig_yoy.update_layout(
-        xaxis_title="Year",
-        yaxis_title="Monthly Average (₪)",
-        xaxis_type='category',
-        legend=dict(
-            orientation="v",
-            yanchor="top",
-            y=1,
-            xanchor="left",
-            x=1.02
+    # Date range selector for this plot
+    if not monthly_totals_yoy.empty:
+        col1, col2 = st.columns(2)
+        
+        available_months = sorted(monthly_totals_yoy['YearMonth'].unique())
+        
+        with col1:
+            start_month = st.selectbox(
+                "Start Month",
+                options=available_months,
+                index=0,
+                key="yoy_start_month"
+            )
+        
+        with col2:
+            end_month = st.selectbox(
+                "End Month",
+                options=available_months,
+                index=len(available_months) - 1,
+                key="yoy_end_month"
+            )
+        
+        # Filter data by selected range
+        monthly_totals_yoy = monthly_totals_yoy[
+            (monthly_totals_yoy['YearMonth'] >= start_month) & 
+            (monthly_totals_yoy['YearMonth'] <= end_month)
+        ]
+        
+        # Create plot showing monthly values for each category
+        fig_yoy = px.line(
+            monthly_totals_yoy,
+            x='YearMonth',
+            y='Total',
+            color='Category',
+            title=f"Monthly Spending by Category - {selected_category_yoy}",
+            markers=True
         )
-    )
-    
-    st.plotly_chart(fig_yoy, use_container_width=True)
+        
+        fig_yoy.update_layout(
+            xaxis_title="Month",
+            yaxis_title="Amount (₪)",
+            legend=dict(
+                orientation="v",
+                yanchor="top",
+                y=1,
+                xanchor="left",
+                x=1.02
+            )
+        )
+        
+        st.plotly_chart(fig_yoy, use_container_width=True)
+    else:
+        st.info("No data available for the selected category")
 
 def main():
     st.title("💰 streamlit-splitwise-dashboard")
     
-    # Check if data exists
+    # Initialize session state for modals
+    if 'show_new_group_modal' not in st.session_state:
+        st.session_state.show_new_group_modal = False
+    if 'show_manage_groups' not in st.session_state:
+        st.session_state.show_manage_groups = False
+    if 'navigate_to_manage_groups' not in st.session_state:
+        st.session_state.navigate_to_manage_groups = False
+    
+    # Check if groups need to be migrated
+    groups_mgr = get_groups_manager()
     dm = get_data_manager()
+    
+    # Handle migration from old structure to groups
+    if not groups_mgr.has_groups() and dm.data_exists():
+        with st.spinner("Migrating to groups structure..."):
+            groups_mgr.migrate_existing_data()
+        st.success("✅ Successfully migrated to groups structure!")
+        st.rerun()
     
     if not dm.data_exists():
         # First-time setup
         show_setup_wizard()
         return
     
+    # Render group selector
+    render_group_selector()
+    
+    # Show new group modal if requested
+    if st.session_state.show_new_group_modal:
+        with st.container():
+            show_new_group_modal()
+            if st.button("Cancel"):
+                st.session_state.show_new_group_modal = False
+                st.rerun()
+    
     # Load data
     df = load_persisted_data()
     
     # Navigation
     st.sidebar.header("📊 Navigation")
-    page = st.sidebar.radio("Select Page", ["Overview", "Analytics", "Income & Savings", "Data Management"])
+    
+    # Handle navigation from Manage button or restore after group switch
+    if st.session_state.navigate_to_manage_groups:
+        default_page = "Manage Groups"
+        # Clear the flag AFTER using it
+    elif 'current_page' in st.session_state:
+        default_page = st.session_state.current_page
+    else:
+        default_page = "Overview"
+    
+    page_options = ["Overview", "Analytics", "Income & Savings", "Data Management", "Combined Analytics", "Manage Groups"]
+    page = st.sidebar.radio("Select Page", page_options, 
+                           index=page_options.index(default_page) if default_page in page_options else 0,
+                           key="main_page_selector")
+    
+    # Clear navigation flag after page is selected
+    if st.session_state.navigate_to_manage_groups:
+        st.session_state.navigate_to_manage_groups = False
+    
+    # Store current page selection only if it changed
+    if 'current_page' not in st.session_state or st.session_state.current_page != page:
+        st.session_state.current_page = page
     
     # Filters (if not on data management or income page)
-    if page not in ["Data Management", "Income & Savings"] and not df.empty:
+    if page not in ["Data Management", "Income & Savings", "Combined Analytics", "Manage Groups"] and not df.empty:
         st.sidebar.header("🔍 Filters")
         
         # Date range filter
@@ -1067,7 +2012,7 @@ def main():
             max_value=max_date
         )
         
-        # Apply filters
+        # Apply date filters
         if len(date_range) == 2:
             df = df[
                 (df['Date'].dt.date >= date_range[0]) &
@@ -1089,6 +2034,10 @@ def main():
         show_income_tracking()
     elif page == "Data Management":
         show_data_management()
+    elif page == "Combined Analytics":
+        show_combined_analytics()
+    elif page == "Manage Groups":
+        show_manage_groups_page()
 
 if __name__ == "__main__":
     main()

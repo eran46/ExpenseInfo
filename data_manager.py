@@ -440,3 +440,51 @@ class DataManager:
     def income_data_exists(self):
         """Check if income data file exists"""
         return self.income_file.exists() and self.income_file.stat().st_size > 0
+    
+    # Member-specific methods for groups feature
+    def get_member_columns(self, df):
+        """Identify member columns (non-standard columns)"""
+        standard_cols = ['Date', 'Description', 'Category', 'Cost', 'Currency', 
+                        'source', 'hash', 'id', 'created_at', 'date', 'description',
+                        'category', 'cost', 'currency']
+        return [col for col in df.columns if col not in standard_cols]
+    
+    def calculate_member_expenses(self, df, member_name: str) -> dict:
+        """Calculate expense breakdown for specific member
+        
+        Splitwise format:
+        - Positive value = Person PAID this amount (their actual expense)
+        - Negative value = Person OWES this amount (debt to whoever paid)
+        """
+        if member_name not in df.columns:
+            return None
+        
+        member_data = df[member_name].fillna(0)
+        
+        # What they actually paid (positive values)
+        total_paid = float(member_data[member_data > 0].sum())
+        
+        # What they owe to others (absolute of negative values)
+        total_owed_by_them = float(abs(member_data[member_data < 0].sum()))
+        
+        # Net balance: paid - owed
+        # Positive = they are owed money, Negative = they owe money
+        net_balance = total_paid - total_owed_by_them
+        
+        return {
+            'total_paid': total_paid,  # What they paid (their expenses)
+            'total_owed_by_them': total_owed_by_them,  # What they owe
+            'net_balance': net_balance,  # Positive = owed to them, Negative = they owe
+            'transaction_count': int((member_data != 0).sum())
+        }
+    
+    def get_member_transactions(self, df, member_name: str, exclude_zero=True):
+        """Get transactions involving specific member"""
+        if member_name not in df.columns:
+            return pd.DataFrame()
+        
+        member_df = df.copy()
+        if exclude_zero:
+            member_df = member_df[member_df[member_name] != 0]
+        
+        return member_df
