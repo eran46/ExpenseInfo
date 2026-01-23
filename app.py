@@ -306,6 +306,62 @@ def render_group_selector():
         if st.button("⚙️ Manage", use_container_width=True, key="manage_groups_btn"):
             st.session_state.navigate_to_manage_groups = True
             st.rerun()
+    
+    # Currency selector
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("💱 Display Currency")
+    
+    # Get group's base currency (will be from currency_settings.json in future)
+    # For now, show all available currencies as a temporary measure
+    # TODO: Replace with locked base currency from group settings
+    available_currencies = get_available_currencies()
+    
+    # Initialize session state for target currency if not exists
+    if 'target_currency' not in st.session_state:
+        st.session_state.target_currency = 'ILS'
+    
+    # Display locked base currency (read-only for now, selector temporarily enabled)
+    # TODO Phase 0: Remove selector, show only locked base currency with info text
+    st.sidebar.info("⚠️ Future: Base currency will be set during group creation and locked.")
+    
+    target_currency = st.sidebar.selectbox(
+        "Target Currency (temporary - will be locked)",
+        options=available_currencies,
+        index=available_currencies.index(st.session_state.target_currency) if st.session_state.target_currency in available_currencies else 0,
+        key="currency_selector",
+        help="After Phase 0 implementation, this will be set once during group creation and cannot be changed."
+    )
+    
+    # Update session state if changed
+    if target_currency != st.session_state.target_currency:
+        st.session_state.target_currency = target_currency
+
+def get_available_currencies():
+    """Get all currencies available in current group's data"""
+    try:
+        groups_mgr = get_groups_manager()
+        if not groups_mgr.has_groups():
+            return ['ILS']
+        
+        active_group = groups_mgr.get_active_group()
+        group_path = groups_mgr.get_group_data_path(active_group['id'])
+        dm = DataManager(group_path)
+        
+        data = dm.load_data()
+        currencies = set()
+        
+        # Get currencies from transactions
+        for txn in data.get('transactions', []):
+            currency = txn.get('currency', 'ILS')
+            if currency and pd.notna(currency):
+                currencies.add(currency)
+        
+        # Always include ILS as an option
+        currencies.add('ILS')
+        
+        return sorted(list(currencies))
+    except:
+        return ['ILS']
 
 def render_member_filter(df):
     """Add member filter to sidebar for group data"""
@@ -1311,14 +1367,50 @@ def show_combined_analytics():
     
     # Calculate metrics based on view mode
     if view_mode == "All Group Expenses":
-        # Month filter for all plots (except timeline)
-        combined_df_filtered = combined_df.copy()
+        # Date range selection
+        st.subheader("📅 Date Range")
+        col_date1, col_date2 = st.columns(2)
+        
+        # Get min/max dates from combined data
+        min_date = combined_df['Date'].min().date()
+        max_date = combined_df['Date'].max().date()
+        
+        with col_date1:
+            start_date = st.date_input(
+                "Start Date",
+                value=min_date,
+                min_value=min_date,
+                max_value=max_date,
+                key="combined_all_start_date"
+            )
+        
+        with col_date2:
+            end_date = st.date_input(
+                "End Date",
+                value=max_date,
+                min_value=min_date,
+                max_value=max_date,
+                key="combined_all_end_date"
+            )
+        
+        # Apply date range filter
+        combined_df_filtered = combined_df[
+            (combined_df['Date'].dt.date >= start_date) & 
+            (combined_df['Date'].dt.date <= end_date)
+        ].copy()
+        
+        combined_df_original_filtered = combined_df_original[
+            (combined_df_original['Date'].dt.date >= start_date) & 
+            (combined_df_original['Date'].dt.date <= end_date)
+        ].copy()
+        
+        # Month filter for all plots (except timeline) - within selected date range
         combined_df_filtered['YearMonth'] = combined_df_filtered['Date'].dt.to_period('M')
         available_months_all = sorted(combined_df_filtered['YearMonth'].unique(), reverse=True)
         
         month_options_all = ['All Time'] + [str(m) for m in available_months_all]
         selected_month_all = st.selectbox(
-            "Filter by Month",
+            "Filter by Month (within selected date range)",
             options=month_options_all,
             key="combined_all_month_filter"
         )
@@ -1326,20 +1418,23 @@ def show_combined_analytics():
         # Apply month filter if selected
         if selected_month_all != 'All Time':
             combined_df_filtered = combined_df_filtered[combined_df_filtered['YearMonth'] == pd.Period(selected_month_all)]
+            combined_df_original_filtered = combined_df_original_filtered[
+                combined_df_original_filtered['Date'].dt.to_period('M') == pd.Period(selected_month_all)
+            ]
         
         # Show metrics for all expenses
         col1, col2, col3, col4 = st.columns(4)
         
-        # Calculate Total Spent as sum of member expenses from ORIGINAL unfiltered data (matches Overview ₪222k)
+        # Calculate Total Spent as sum of member expenses from filtered data
         dm = get_data_manager()
-        member_cols = dm.get_member_columns(combined_df_original) if not combined_df_original.empty else []
+        member_cols = dm.get_member_columns(combined_df_original_filtered) if not combined_df_original_filtered.empty else []
         
         total_spent = 0.0
         if member_cols:
             for member_col in member_cols:
-                if member_col in combined_df_original.columns:
+                if member_col in combined_df_original_filtered.columns:
                     # Convert to numeric to avoid string comparison errors
-                    member_values = pd.to_numeric(combined_df_original[member_col], errors='coerce').fillna(0)
+                    member_values = pd.to_numeric(combined_df_original_filtered[member_col], errors='coerce').fillna(0)
                     total_spent += member_values[member_values > 0].sum()
         
         with col1:
@@ -1434,78 +1529,96 @@ def show_combined_analytics():
         user_calc = UserExpenseCalculator(groups_mgr)
         member_data = user_calc.calculate_user_total_expense(selected_group_ids, selected_member)
         
-        # Month filter for individual member view - at the top
+        # Store original all-time metrics (unaffected by filters)
+        total_expense_alltime = member_data['total_expense']
+        net_balance_alltime = member_data['net_balance']
+        
+        # Member metrics - All Time (unaffected by date range)
+        st.subheader(f"📊 {selected_member}'s Overall Summary")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Total Personal Expense (All Time)", f"₪{total_expense_alltime:,.2f}", 
+                     help="Total amount this person actually paid across all transactions")
+        with col2:
+            if net_balance_alltime > 0:
+                # Positive net = paid more than owed = they are OWED money
+                balance_label = "They Are Owed (All Time)"
+                balance_help = "This person is owed money (paid more than their share)"
+            elif net_balance_alltime < 0:
+                # Negative net = owed more than paid = they OWE money
+                balance_label = "They Owe (All Time)"
+                balance_help = "This person owes money (paid less than their share)"
+            else:
+                balance_label = "Balanced (All Time)"
+                balance_help = "This person is settled up"
+            st.metric(balance_label, f"₪{abs(net_balance_alltime):,.2f}",
+                     help=balance_help)
+        
+        st.markdown("---")
+        
+        # Date range selection for member view
+        st.subheader("📅 Filter by Date Range")
         member_txns = member_data.get('transactions', [])
         selected_month_member = 'All Time'
         
         if member_txns and len(member_txns) > 0:
-            member_txns_df_filter = pd.DataFrame(member_txns)
+            member_txns_df_all = pd.DataFrame(member_txns)
             
-            if 'date' in member_txns_df_filter.columns:
-                member_txns_df_filter['date'] = pd.to_datetime(member_txns_df_filter['date'])
+            if 'date' in member_txns_df_all.columns:
+                member_txns_df_all['date'] = pd.to_datetime(member_txns_df_all['date'])
+                
+                # Get min/max dates from member transactions
+                min_date_member = member_txns_df_all['date'].min().date()
+                max_date_member = member_txns_df_all['date'].max().date()
+                
+                col_date1, col_date2 = st.columns(2)
+                
+                with col_date1:
+                    start_date_member = st.date_input(
+                        "Start Date",
+                        value=min_date_member,
+                        min_value=min_date_member,
+                        max_value=max_date_member,
+                        key="combined_member_start_date"
+                    )
+                
+                with col_date2:
+                    end_date_member = st.date_input(
+                        "End Date",
+                        value=max_date_member,
+                        min_value=min_date_member,
+                        max_value=max_date_member,
+                        key="combined_member_end_date"
+                    )
+                
+                # Apply date range filter to member transactions
+                member_txns_df_filter = member_txns_df_all[
+                    (member_txns_df_all['date'].dt.date >= start_date_member) & 
+                    (member_txns_df_all['date'].dt.date <= end_date_member)
+                ].copy()
+                
+                # Month filter within selected date range
                 member_txns_df_filter['YearMonth'] = member_txns_df_filter['date'].dt.to_period('M')
                 available_months_member = sorted(member_txns_df_filter['YearMonth'].unique(), reverse=True)
                 
                 month_options_member = ['All Time'] + [str(m) for m in available_months_member]
                 selected_month_member = st.selectbox(
-                    "Filter by Month",
+                    "Filter by Month (within selected date range)",
                     options=month_options_member,
                     key="member_all_month_filter"
                 )
-        
-        # Calculate how much they're owed FROM or owe TO everyone else
-        all_members_data = user_calc.calculate_all_members_expenses(selected_group_ids)
-        
-        # For this member, calculate total debt to/from ALL other members
-        total_debt_to_member = 0  # How much others owe to this member
-        total_debt_from_member = 0  # How much this member owes to others
-        
-        for other_member, other_data in all_members_data.items():
-            if other_member != selected_member:
-                # If other member has negative balance, they owe money
-                # If this member should receive that money, add to debt_to_member
-                # This is approximate - real debt tracking needs transaction-level analysis
-                other_balance = other_data['net_balance']
-                if other_balance < 0:  # Other person owes
-                    # They might owe to our member
-                    pass  # Skip for now, use simple net balance
-        
-        # Simplified: just show net balance from member's perspective
-        # Member metrics - removed redundant Total Owed By Them
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.metric("Total Personal Expense", f"₪{member_data['total_expense']:,.2f}", 
-                     help="Total amount this person actually paid")
-        with col2:
-            net_balance = member_data['net_balance']
-            if net_balance > 0:
-                # Positive net = paid more than owed = they are OWED money
-                balance_label = "They Are Owed"
-                balance_help = "This person is owed money (paid more than their share)"
-            elif net_balance < 0:
-                # Negative net = owed more than paid = they OWE money
-                balance_label = "They Owe"
-                balance_help = "This person owes money (paid less than their share)"
-            else:
-                balance_label = "Balanced"
-                balance_help = "This person is settled up"
-            st.metric(balance_label, f"₪{abs(net_balance):,.2f}",
-                     help=balance_help)
         
         st.markdown("---")
         
         # Category breakdown for member
         st.subheader(f"📊 {selected_member}'s Expense Breakdown")
         
-        # Get member transactions for month filtering
+        # Get member transactions for month filtering (using date range filtered data)
         if member_txns and len(member_txns) > 0:
-            member_txns_df = pd.DataFrame(member_txns)
-            
-            # Check if date column exists and convert
-            if 'date' in member_txns_df.columns:
-                member_txns_df['date'] = pd.to_datetime(member_txns_df['date'])
-                member_txns_df['YearMonth'] = member_txns_df['date'].dt.to_period('M')
+            # Use the already filtered data from date range selection
+            if 'date' in member_txns_df_filter.columns:
+                member_txns_df = member_txns_df_filter.copy()
                 
                 # Apply month filter if selected
                 if selected_month_member != 'All Time':
@@ -1544,14 +1657,14 @@ def show_combined_analytics():
         # Spending by group for this member
         st.subheader(f"{selected_member}'s Spending by Group")
         
-        # Apply month filter to group spending if available
+        # Apply month filter to group spending if available (using date range filtered data)
         if member_txns and len(member_txns) > 0:
-            member_txns_df_group = pd.DataFrame(member_txns)
-            
-            if 'date' in member_txns_df_group.columns and selected_month_member != 'All Time':
-                member_txns_df_group['date'] = pd.to_datetime(member_txns_df_group['date'])
-                member_txns_df_group['YearMonth'] = member_txns_df_group['date'].dt.to_period('M')
-                member_txns_df_group = member_txns_df_group[member_txns_df_group['YearMonth'] == pd.Period(selected_month_member)]
+            # Use the already filtered data from date range selection
+            if 'date' in member_txns_df_filter.columns:
+                member_txns_df_group = member_txns_df_filter.copy()
+                
+                if selected_month_member != 'All Time':
+                    member_txns_df_group = member_txns_df_group[member_txns_df_group['YearMonth'] == pd.Period(selected_month_member)]
                 
                 # Recalculate group breakdown from filtered transactions using Cost
                 group_breakdown = {}
@@ -1565,7 +1678,7 @@ def show_combined_analytics():
                     except (ValueError, TypeError):
                         continue
             else:
-                # No month filter, calculate from all groups
+                # No date column, calculate from all groups
                 group_breakdown = {}
                 for group_id in selected_group_ids:
                     group = next((g for g in groups if g['id'] == group_id), None)
@@ -1594,17 +1707,38 @@ def show_combined_analytics():
             )
             st.plotly_chart(fig_group_bar, use_container_width=True)
         
-        # Transaction list
+        # Transaction list - use filtered transactions
         st.subheader(f"{selected_member}'s Transactions")
-        member_txns = member_data['transactions']
         
-        if member_txns:
+        # Use filtered transactions based on date range and month selection
+        if member_txns and len(member_txns) > 0 and 'date' in member_txns_df_filter.columns:
+            member_txns_df_display = member_txns_df_filter.copy()
+            
+            # Apply month filter if selected
+            if selected_month_member != 'All Time':
+                member_txns_df_display = member_txns_df_display[
+                    member_txns_df_display['YearMonth'] == pd.Period(selected_month_member)
+                ]
+            
+            if not member_txns_df_display.empty:
+                df_display = member_txns_df_display[['date', 'group_name', 'description', 'category', 
+                                      'total_cost', 'member_share']].copy()
+                df_display.columns = ['Date', 'Group', 'Description', 'Category', 
+                                     'Total Cost', 'Your Share']
+                df_display = df_display.sort_values('Date', ascending=False)
+            else:
+                df_display = pd.DataFrame()
+        elif member_txns:
             df_txns = pd.DataFrame(member_txns)
             df_display = df_txns[['date', 'group_name', 'description', 'category', 
                                   'total_cost', 'member_share']].copy()
             df_display.columns = ['Date', 'Group', 'Description', 'Category', 
                                  'Total Cost', 'Your Share']
             df_display = df_display.sort_values('Date', ascending=False)
+        else:
+            df_display = pd.DataFrame()
+        
+        if not df_display.empty:
             
             st.dataframe(df_display, use_container_width=True, hide_index=True)
             
@@ -1616,6 +1750,8 @@ def show_combined_analytics():
                 file_name=f"{selected_member}_expenses.csv",
                 mime="text/csv"
             )
+        else:
+            st.info("No transactions found for the selected date range.")
 
 def show_manage_groups_page():
     """Manage groups page"""
