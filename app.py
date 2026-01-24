@@ -306,6 +306,13 @@ def load_data_from_file(file, file_type):
             df = pd.read_excel(file)
         
         # Data cleaning
+        # Strip whitespace from text fields to ensure consistent hashing
+        # This prevents duplicate detection failures when comparing CSV vs Excel imports
+        if 'Description' in df.columns:
+            df['Description'] = df['Description'].astype(str).str.strip()
+        if 'Category' in df.columns:
+            df['Category'] = df['Category'].astype(str).str.strip()
+        
         # Convert Date column to datetime
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
         
